@@ -91,6 +91,17 @@ bool ksu_bundled = false;
 module_param_named(bundled, ksu_bundled, bool, 0);
 #endif
 
+/*
+ * When false, the ni-syscall slot dispatcher install is skipped
+ * entirely: no kernel text is poked.  The module then loads inert (the
+ * manager cannot talk to it — the hooked syscall IS the control
+ * channel), which isolates everything else — vermagic/CRCs, init
+ * ordering, module lifetime — from the text-poke crash class observed
+ * on devices where the slot patch hard-crashes at load.
+ */
+bool ksu_syscall_hook = true;
+module_param_named(syscall_hook, ksu_syscall_hook, bool, 0);
+
 int __init kernelsu_init(void)
 {
     int ret;
@@ -147,7 +158,11 @@ int __init kernelsu_init(void)
         return ret;
     }
 
-    ksu_syscall_hook_init();
+    if (ksu_syscall_hook) {
+        ksu_syscall_hook_init();
+    } else {
+        pr_info("syscall hook disabled by module param; loading inert (manager will not work)\n");
+    }
 
     // Block modules early, before vendor modules are loaded in second stage.
     ksu_module_blacklist_init();
