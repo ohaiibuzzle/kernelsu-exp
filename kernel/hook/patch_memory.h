@@ -30,4 +30,16 @@ unsigned long phys_from_virt(unsigned long addr, int *err);
 int ksu_patch_text(void *dst, void *src, size_t len, int flags);
 void *scan_call_to(void *start, size_t size, void *target);
 
+#ifdef __aarch64__
+/*
+ * Resolve the running kernel's kimage_voffset and its [_text, _end) image
+ * span once, in process context, before the first ksu_patch_text() call.
+ * Image-span patches then translate with plain arithmetic instead of the
+ * compiled-in init_mm walk, and a translation that lands outside the
+ * image's physical span is refused before any fixmap write.
+ * Returns 0 on success.
+ */
+int ksu_patch_phys_init(void);
+#endif
+
 #endif

@@ -3,6 +3,7 @@
 #include "../syscall_hook.h"
 
 #include <linux/kallsyms.h>
+#include <linux/moduleparam.h>
 #include <linux/mutex.h>
 #include <asm/cacheflush.h>
 #include "infra/symbol_resolver.h"
@@ -12,6 +13,15 @@
 
 syscall_fn_t *ksu_syscall_table = NULL;
 int ksu_dispatcher_nr = -1;
+
+/*
+ * Optional dispatcher slot override (module parameter). <= 0 keeps the
+ * automatic first-unused-slot selection. The requested slot is validated
+ * against __arm64_sys_ni_syscall at init; an invalid request falls back
+ * to the automatic slot instead of clobbering a live syscall.
+ */
+static int dispatcher_slot_param;
+module_param_named(dispatcher_slot, dispatcher_slot_param, int, 0);
 
 // Hook registration table — read with READ_ONCE from tracepoint/dispatcher
 // context, written with WRITE_ONCE from init/exit context.
@@ -114,7 +124,8 @@ void ksu_syscall_table_unhook(int nr)
     pr_warn("syscall %d not found in hooked entries\n", nr);
 }
 
-static int __init ksu_find_ni_syscall_slots(int *out_slots, int max_slots)
+static int __init ksu_find_ni_syscall_slots(int *out_slots, int max_slots,
+                                            unsigned long *out_ni_syscall)
 {
     unsigned long ni_syscall;
     int i, count = 0;
@@ -135,6 +146,9 @@ static int __init ksu_find_ni_syscall_slots(int *out_slots, int max_slots)
             pr_info("ni_syscall %d: %d\n", count, i);
         }
     }
+
+    if (out_ni_syscall)
+        *out_ni_syscall = ni_syscall;
 
     return count;
 }
@@ -199,6 +213,7 @@ bool ksu_has_syscall_hook(int nr)
 
 void __init ksu_syscall_hook_init(void)
 {
+    unsigned long ni_syscall = 0;
     int ni_slot;
 
     memset(syscall_hooks, 0, sizeof(syscall_hooks));
@@ -209,14 +224,43 @@ void __init ksu_syscall_hook_init(void)
     if (!ksu_syscall_table)
         return;
 
+    // Resolve the image phys constants before the first poke. On failure
+    // patches fall back to the init_mm walk with alias verification, so
+    // continue rather than abort: a hook that cannot be installed safely
+    // simply fails, and the bridge stays disarmed.
+    if (ksu_patch_phys_init())
+        pr_err("ksu_patch_phys_init failed; patches use the page-table walk\n");
+
     // Find one ni_syscall slot for the dispatcher
-    if (ksu_find_ni_syscall_slots(&ni_slot, 1) < 1) {
+    if (ksu_find_ni_syscall_slots(&ni_slot, 1, &ni_syscall) < 1) {
         pr_err("failed to find ni_syscall slot for dispatcher\n");
         return;
     }
 
+    // Honour dispatcher_slot only if it really is an unused slot; anything
+    // else falls back to the automatic selection.
+    if (dispatcher_slot_param > 0) {
+        if (dispatcher_slot_param < __NR_syscalls &&
+            (unsigned long)READ_ONCE(ksu_syscall_table[dispatcher_slot_param]) == ni_syscall) {
+            ni_slot = dispatcher_slot_param;
+            pr_info("dispatcher slot forced to %d\n", ni_slot);
+        } else {
+            pr_warn("dispatcher_slot=%d rejected (range or not ni_syscall); using %d\n",
+                    dispatcher_slot_param, ni_slot);
+        }
+    }
+
+    // Install before arming: ksu_dispatcher_nr must stay -1 unless the
+    // table entry really holds the dispatcher, otherwise the sys_enter
+    // bridge would redirect hooked syscalls into a stale slot and every
+    // one of them would return -ENOSYS.
+    ksu_syscall_table_hook(ni_slot, (syscall_fn_t)ksu_syscall_dispatcher, NULL);
+    if ((unsigned long)READ_ONCE(ksu_syscall_table[ni_slot]) !=
+        (unsigned long)ksu_syscall_dispatcher) {
+        pr_err("dispatcher install at slot %d failed; bridge stays disarmed\n", ni_slot);
+        return;
+    }
     ksu_dispatcher_nr = ni_slot;
-    ksu_syscall_table_hook(ksu_dispatcher_nr, (syscall_fn_t)ksu_syscall_dispatcher, NULL);
     pr_info("dispatcher installed at slot %d\n", ksu_dispatcher_nr);
 }
 

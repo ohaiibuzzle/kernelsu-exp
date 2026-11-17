@@ -9,10 +9,12 @@
 #include "klog.h" // IWYU pragma: keep
 #include "linux/cpumask.h"
 #include "linux/gfp.h" // IWYU pragma: keep
+#include "linux/init.h" // IWYU pragma: keep
 #include "linux/uaccess.h"
 #include "linux/stop_machine.h"
 #include "asm/cacheflush.h"
 #include "asm-generic/fixmap.h"
+#include "infra/symbol_resolver.h"
 
 // https://github.com/fuqiuluo/ovo/blob/f7da411458e87d32438dc14fce5a3313ed0c967e/ovo/mmuhack.c#L21
 
@@ -76,6 +78,60 @@ fail:
     return 0;
 }
 
+/*
+ * Runtime-resolved kernel-image physical translation.
+ *
+ * phys_from_virt() walks init_mm with the pgtable layout COMPILED IN from
+ * the build tree; on a module built against a different tree (different
+ * CONFIG_PGTABLE_LEVELS / VA_BITS) the walk can resolve a kernel-image
+ * address to a wrong -- but valid and mapped -- physical page, and the
+ * fixmap poke then corrupts it: a hard crash with no error path.
+ *
+ * Instead, resolve the kernel's own kimage_voffset once at init (the same
+ * constant __aarch64_text_write uses) and translate image-span addresses
+ * with plain arithmetic. The image span [_text, _end) comes from kallsyms
+ * as well, so a translation landing outside the image's physical span is
+ * refused instead of poked.
+ */
+static unsigned long ksu_kimage_voffset;
+static unsigned long ksu_virt_image_start;
+static unsigned long ksu_virt_image_end;
+
+int __init ksu_patch_phys_init(void)
+{
+    unsigned long kv_addr;
+
+    kv_addr = (unsigned long)ksu_resolve_symbol_for_functable_hook("kimage_voffset");
+    if (!kv_addr) {
+        pr_err("patch_memory: kimage_voffset not resolvable\n");
+        return -ENOENT;
+    }
+    ksu_kimage_voffset = *(volatile unsigned long *)kv_addr;
+
+    ksu_virt_image_start = (unsigned long)ksu_resolve_symbol_for_functable_hook("_text");
+    ksu_virt_image_end = (unsigned long)ksu_resolve_symbol_for_functable_hook("_end");
+    if (!ksu_virt_image_start || ksu_virt_image_end <= ksu_virt_image_start) {
+        pr_err("patch_memory: bad image span 0x%lx-0x%lx\n",
+               ksu_virt_image_start, ksu_virt_image_end);
+        ksu_kimage_voffset = 0;
+        return -ENOENT;
+    }
+
+    if (ksu_virt_image_start <= ksu_kimage_voffset ||
+        ksu_virt_image_start - ksu_kimage_voffset > (1UL << 40)) {
+        pr_err("patch_memory: insane kv 0x%lx for _text 0x%lx\n",
+               ksu_kimage_voffset, ksu_virt_image_start);
+        ksu_kimage_voffset = 0;
+        return -EINVAL;
+    }
+
+    pr_info("patch_memory: kv=0x%lx image [0x%lx,0x%lx) phys [0x%lx,0x%lx)\n",
+            ksu_kimage_voffset, ksu_virt_image_start, ksu_virt_image_end,
+            ksu_virt_image_start - ksu_kimage_voffset,
+            ksu_virt_image_end - ksu_kimage_voffset);
+    return 0;
+}
+
 // This function appears in 5.14:
 // https://github.com/torvalds/linux/commit/fade9c2c6ee2baea7df8e6059b3f143c681e5ce4#diff-fc9ef24572e183c6c049b5ae8029762159787f8669d909452bdf40db748f94a7L52
 // https://github.com/torvalds/linux/commit/814b186079cd54d3fe3b6b8ab539cbd44705ef9d#diff-fc9ef24572e183c6c049b5ae8029762159787f8669d909452bdf40db748f94a7R53
@@ -122,19 +178,49 @@ struct patch_text_info {
 // ^1: https://github.com/NothingOSS/android_kernel_device_modules_6.1_nothing_mt6878/blob/957dac185efe46cbf6336b0fff9516d84c8cd78f/drivers/misc/mediatek/mkp/mkp_main.c#L29
 // ^2: https://github.com/torvalds/linux/commit/c0eb315ad9719e41ce44708455cc69df7ac9f3f8
 // Runs under stop_machine; propagate errors without console output.
+//
+// Translation order of preference:
+//   1. kernel image span + runtime-resolved kimage_voffset arithmetic,
+//      bounds-checked against the image's physical span;
+//   2. the compiled-in init_mm walk (vmalloc/module targets, or when
+//      ksu_patch_phys_init() could not resolve the constants).
+// Either way the fixmap alias is read back and compared with the direct
+// mapping before any write, so a wrong-but-mapped physical page fails
+// with -EFAULT instead of being corrupted.
 static int ksu_patch_text_nosync(void *dst, void *src, size_t len, int flags)
 {
     unsigned long p = (unsigned long)dst;
+    unsigned long phy;
     int ret;
+    void *map;
 
-    int phy_err;
-    unsigned long phy = phys_from_virt(p, &phy_err);
-    if (phy_err) {
-        ret = phy_err;
-        goto err;
+    if (ksu_kimage_voffset && p >= ksu_virt_image_start && p < ksu_virt_image_end) {
+        phy = p - ksu_kimage_voffset;
+        if (phy < ksu_virt_image_start - ksu_kimage_voffset ||
+            phy + len > ksu_virt_image_end - ksu_kimage_voffset)
+            return -ERANGE;
+    } else {
+        int phy_err;
+
+        phy = phys_from_virt(p, &phy_err);
+        if (phy_err)
+            return phy_err;
     }
 
-    void *map = set_fixmap_offset(FIX_TEXT_POKE0, phy);
+    map = set_fixmap_offset(FIX_TEXT_POKE0, phy);
+
+    {
+        unsigned long direct = 0, alias = 0;
+        size_t vlen = len < sizeof(direct) ? len : sizeof(direct);
+
+        ret = (int)copy_from_kernel_nofault(&direct, dst, vlen);
+        if (!ret)
+            ret = (int)copy_from_kernel_nofault(&alias, map, vlen);
+        if (ret || direct != alias) {
+            clear_fixmap(FIX_TEXT_POKE0);
+            return -EFAULT;
+        }
+    }
 
     ret = (int)copy_to_kernel_nofault(map, src, len);
 
@@ -147,7 +233,6 @@ static int ksu_patch_text_nosync(void *dst, void *src, size_t len, int flags)
             ksu_flush_dcache(dst, len);
     }
 
-err:
     return ret;
 }
 
